@@ -130,6 +130,11 @@ class ProgramExecutor():
     
     async def visit(self, node, next_node=None, next_next_node=None, prev_node=None, parent_node=None, grandparent_node=None):
 
+        # if we are after a break point then we return nothing
+        # (note that this flag will be cleared once the loop is ended)
+        if self.caught_stop_iteration:
+            return ""
+
         if node.expr_name == 'variable_name':
             return node.text
 
@@ -380,8 +385,9 @@ class ProgramExecutor():
                         "block_content": self.block_content[-1],
                         "partial_output": self.extend_prefix,
                         "parser_node": node,
-                        "next_node": node.children[-1],
-                        "next_next_node": next_node,
+                        "block_close_node": node.children[-1],
+                        "next_node": next_node,
+                        "next_next_node": next_next_node,
                         "prev_node": node.children[0]
                     }
                 
