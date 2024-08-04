@@ -1,98 +1,141 @@
-import os
-import requests
-import inspect
-import time
-import json
-import re
-import datetime
+import ast
 import asyncio
+import json
+import inspect
+import queue
+import sys
+import textwrap
+import types
 
-log_file = None
+import numpy as np
 
+class _Rewrite(ast.NodeTransformer):
+    def __init__(self, source_lines):
+        self.source_lines = source_lines
+        self.indentation = [None for _ in source_lines]
 
-def open_log_file():
-    global log_file
-    if log_file is None:
-        log_file = open("log.txt", "a")
-    return log_file
+    def visit_JoinedStr(self, node):
+        for value in node.values:
+            if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                self._dedent_constant(value, node.lineno)
+        return node
 
+    def visit_Constant(self, node):
+        if isinstance(node.value, str) and "\n" in node.value:
+            self._dedent_constant(node, node.lineno)
+        return node
 
-def close_log_file():
-    global log_file
-    if log_file is not None:
-        log_file.close()
-        log_file = None
+    def _dedent_constant(self, node, lineno):
+        start_lineno = lineno - 1
+        start_line = self.source_lines[start_lineno]
+        indent = len(start_line) - len(start_line.lstrip())
 
+        if indent > 0:
+            new_lines = []
+            for line in node.value.split("\n"):
+                if line.startswith(" " * indent):
+                    new_lines.append(line[indent:])
+                else:
+                    new_lines.append(line)
+            node.value = "\n".join(new_lines)
 
-def log(*args):
-    # print(*args)
-    log_file = open_log_file()
-    print(datetime.datetime.now().strftime("%H:%M:%S"), *args, file=log_file)
-    log_file.flush()
-    # Currently never gets closed
+class normalize_notebook_stdout_stderr:
+    """Remaps stdout and stderr back to their normal selves from what ipykernel did to them.
 
+    Based on: https://github.com/ipython/ipykernel/issues/795
+    """
 
-def load(guidance_file):
-    ''' Load a guidance program from the given text file.
+    def __enter__(self):
+        normal_stdout = sys.__stdout__.fileno()
+        self.restore_stdout = None
+        if (
+            getattr(sys.stdout, "_original_stdstream_copy", normal_stdout)
+            != normal_stdout
+        ):
+            self.restore_stdout = sys.stdout._original_stdstream_copy
+            sys.stdout._original_stdstream_copy = normal_stdout
 
-    If the passed file is a valid local file it will be loaded directly.
-    Otherwise, if it starts with "http://" or "https://" it will be loaded
-    from the web.
-    '''
+        normal_stderr = sys.__stderr__.fileno()
+        self.restore_stderr = None
+        if (
+            getattr(sys.stderr, "_original_stdstream_copy", normal_stderr)
+            != normal_stderr
+        ):
+            self.restore_stderr = sys.stderr._original_stdstream_copy
+            sys.stderr._original_stdstream_copy = normal_stderr
 
-    if os.path.exists(guidance_file):
-        with open(guidance_file, 'r') as f:
-            return f.read()
-    elif guidance_file.startswith('http://') or guidance_file.startswith('https://'):
-        return requests.get(guidance_file).text
-    else:
-        raise ValueError('Invalid guidance file: %s' % guidance_file)
-
-
-def chain(programs, **kwargs):
-    ''' Chain together multiple programs into a single program.
-    
-    This merges them into a single program like: {{>program1 hidden=True}}{{>program2 hidden=True}}
-    '''
-
-    from ._program import Program
-
-    new_template = "".join(["{{>program%d hidden=True}}" % i for i in range(len(programs))])
-    for i, program in enumerate(programs):
-        if isinstance(program, Program):
-            kwargs["program%d" % i] = program
-        else:
-            sig = inspect.signature(program)
-            args = ""
-            for name, _ in sig.parameters.items():
-                args += f" {name}={name}"
-            fname = find_func_name(program, kwargs)
-            kwargs["program%d" % i] = Program("{{set (%s%s)}}" % (fname, args), **{fname: program})
-            # kwargs.update({f"func{i}": program})
-    return Program(new_template, **kwargs)
-
-
-def find_func_name(f, used_names):
-    if hasattr(f, "__name__"):
-        prefix = f.__name__.replace("<", "").replace(">", "")
-    else:
-        prefix = "function"
-
-    if prefix not in used_names:
-        return prefix
-    else:
-        for i in range(100):
-            fname = f"{prefix}{i}"
-            if fname not in used_names:
-                return fname
+    def __exit__(self, exc_type, exc_value, traceback):
+        if self.restore_stdout is not None:
+            sys.stderr._original_stdstream_copy = self.restore_stdout
+        if self.restore_stderr is not None:
+            sys.stderr._original_stdstream_copy = self.restore_stderr
 
 
-def strip_markers(s):
-    return re.sub(r"{{!--G.*?--}}", r"", s, flags=re.MULTILINE | re.DOTALL)
+def strip_multiline_string_indents(f):
+    source = textwrap.dedent(inspect.getsource(f))
+    blanks = "\n" * f.__code__.co_firstlineno  # pad the source so the lines in the file line up for the debugger
+    source = blanks + "\n".join(source.splitlines()[1:])  # remove the decorator first line.
+
+    # define the external closure variables so f.__closure__ will match our recompiled version
+    if len(f.__code__.co_freevars) > 0:
+        raise Exception(
+            "You currently must use @guidance(dedent=False) for closure functions (function nested within other functions that reference the outer functions variables)!"
+        )
+#       lines = source.split("\n")
+#       lines[0] = "def __outer__closure_wrap():"
+#       lines[1] = (
+#           "    "
+#           + ",".join(f.__code__.co_freevars)
+#           + " = "
+#           + ",".join("None" for _ in f.__code__.co_freevars)
+#       )
+#       source = "    \n".join(
+#           lines
+#       )  # TODO: this does not quite work because new_code_obj is now the __outer__closure_wrap() function...could be fixed with work...
+
+    old_code_obj = f.__code__
+    old_ast = ast.parse(source)
+    r = _Rewrite(source.split("\n"))
+    new_ast = r.visit(old_ast)
+    new_code_obj = compile(new_ast, old_code_obj.co_filename, "exec")
+
+    # find the code block
+    for i in range(len(new_code_obj.co_consts)):
+        if str(type(new_code_obj.co_consts[i])) == "<class 'code'>":
+            break
+
+    # create a new function based on the modified code
+    new_f = types.FunctionType(
+        new_code_obj.co_consts[i],
+        f.__globals__,
+        name=f.__name__,
+        argdefs=f.__defaults__,
+        closure=f.__closure__,
+    )
+    new_f.__kwdefaults__ = f.__kwdefaults__
+    return new_f
+
+class CaptureEvents:
+    """Creates a scope where all the events are captured in a queue.
+
+    Note that this does not stop the events from being captured by higher level scopes.
+    """
+
+    def __init__(self, lm):
+        self.lm = lm
+
+    def __enter__(self):
+        self.lm._event_queue = queue.Queue()
+        return self.lm._event_queue
+
+    def __exit__(self, type, value, traceback):
+        self.lm._event_queue = None
 
 
-class JupyterComm():
-    def __init__(self, target_id, ipython_handle, callback=None, on_open=None, mode="register"):
+class JupyterComm:
+    def __init__(
+        self, target_id, ipython_handle, callback=None, on_open=None, mode="register"
+    ):
         from ipykernel.comm import Comm
 
         self.target_name = "guidance_interface_target_" + target_id
@@ -117,7 +160,9 @@ class JupyterComm():
                 self.open_event.set()
                 self._fire_callback({"content": {"data": {"event": "opened"}}})
 
-            self.ipython_handle.kernel.comm_manager.register_target(self.target_name, comm_opened)
+            self.ipython_handle.kernel.comm_manager.register_target(
+                self.target_name, comm_opened
+            )
             # get_ipython().kernel.comm_manager.register_target(self.target_name, comm_opened) # noqa: F821
         elif mode == "open":
             # log("OPENING", self.target_name)
@@ -126,24 +171,6 @@ class JupyterComm():
             # self._fire_callback({"content": {"data": "opened"}})
         else:
             raise Exception("Passed mode must be either 'open' or 'register'!")
-
-    # async def _register(self):
-    #     def comm_opened(comm, open_msg):
-    #         #log("OPENED")
-    #         self.addd = 2
-    #         self.jcomm = comm
-    #         self.jcomm.on_msg(self._fire_callback)
-    #         self.open_event.set()
-    #         self._fire_callback({"content": {"data": {"event": "opened"}}})
-    #     get_ipython().kernel.comm_manager.register_target(self.target_name, comm_opened)
-
-    # def send(self, data, wait=False):
-    #     self.send_queue.append(data)
-    #     if self.jcomm is None:
-    #         return
-    #     for d in self.send_queue:
-    #         self.jcomm.send({"data": json.dumps(d)})
-    #     self.send_queue = []
 
     def clear_send_queue(self):
         while not self.send_queue.empty():
@@ -180,12 +207,28 @@ class JupyterComm():
 # https://stackoverflow.com/questions/15411967/how-can-i-check-if-code-is-executed-in-the-ipython-notebook
 def is_interactive():
     import __main__ as main
-    return not hasattr(main, '__file__')
+
+    return not hasattr(main, "__file__")
 
 
-def escape_template_block(text):
-    return text.replace("$", "&#36;").replace("{", "&#123;").replace("}", "&#125;")
+def log_softmax(array: np.ndarray, axis: int = -1) -> np.ndarray:
+    # https://docs.scipy.org/doc/scipy/reference/generated/scipy.special.log_softmax.html
+    array_maxs: np.ndarray = np.amax(array, axis=axis, keepdims=True)
+    if array_maxs.ndim > 0:
+        array_maxs[~np.isfinite(array_maxs)] = 0
+    elif not np.isfinite(array_maxs):
+        array_maxs = np.zeros(array_maxs.shape)
+    subtract_maxs = array - array_maxs
+    exp = np.exp(subtract_maxs)
+    # suppress warnings about log of zero
+    with np.errstate(divide="ignore"):
+        summed = np.sum(exp, axis=axis, keepdims=True)
+        out = np.log(summed)
+    return subtract_maxs - out
 
 
-def unescape_template_block(text):
-    return text.replace("&#36;", "$").replace("&#123;", "{").replace("&#125;", "}")
+def softmax(array: np.ndarray, axis: int = -1) -> np.ndarray:
+    # https://docs.scipy.org/doc/scipy/reference/generated/scipy.special.softmax.html
+    array_maxs = np.amax(array, axis=axis, keepdims=True)
+    exp_x_shifted = np.exp(array - array_maxs)
+    return exp_x_shifted / np.sum(exp_x_shifted, axis=axis, keepdims=True)
